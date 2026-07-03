@@ -708,3 +708,140 @@ int bl_cam_mipi_mjpeg_init(void)
 exit:
     return ret;
 }
+
+/*
+ * Grayscale MJPEG variant.
+ *
+ * Produces a single-component (YUV400 / 4:0:0) grayscale JPEG instead of the
+ * colour YUV422 stream.  Two changes versus bl_cam_mipi_mjpeg_init():
+ *   1. CAM drops the chroma bytes (CAM_DROP_ALL_ODD_PIXEL turns the YUYV pixel
+ *      stream into packed Y "YY YY...") so the encoder is fed luma only.
+ *   2. The MJPEG core + JPEG header are configured for YUV400.
+ * Output resolution is GRAY_MJPEG_WIDTH x GRAY_MJPEG_HEIGHT.
+ *
+ * Frames are retrieved with the same bl_cam_mjpeg_get()/bl_cam_mjpeg_pop().
+ */
+#define GRAY_MJPEG_WIDTH               320
+#define GRAY_MJPEG_HEIGHT              240
+
+/*
+ * Drop every frame currently held in the MJPEG frame FIFO.
+ * Use this before grabbing a fresh frame when the camera has been free-running
+ * (e.g. during a long transmission): the FIFO head can otherwise point at ring
+ * memory that newer frames have already overwritten.
+ */
+void bl_cam_mjpeg_flush(void)
+{
+    while (MJPEG_Get_Frame_Count() > 0) {
+        MJPEG_Pop_Frame();
+    }
+}
+
+int bl_cam_mipi_mjpeg_gray_init(void)
+{
+    int ret = 0;
+    uint16_t tmpTableY[64] = {0};
+    uint16_t tmpTableUV[64] = {0};
+    uint32_t jpgHeadLength;
+
+    bl_cam_mipi_csi_init();
+
+    CAM_CFG_Type cameraCfg =
+    {
+        .swMode = CAM_SW_MODE_AUTO,
+        .swIntCnt = 0,
+        .pixWidth = CAM_PIX_DATA_BIT_8,       /* 8-bit: CAM already latches 1 byte/pixel (the Y byte) */
+        .dropMode = CAM_DROP_NONE,            /* no extra decimation -> 320 packed Y bytes/line */
+        .linePol = CAM_LINE_ACTIVE_POLARITY_HIGH,
+        .framePol = CAM_FRAME_ACTIVE_POLARITY_HIGH,
+        .camSensorMode = CAM_SENSOR_MODE_V_AND_H,
+        .burstType = CAM_BURST_TYPE_INCR64,
+        .waitCount = 0x40,
+        .memStart = NULL,
+        /* 1 byte/pixel (Y only): ring = sizeCamYY(2) blocks x 8 lines x W bytes.
+           Must match the MJPEG block ping-pong or strips desync -> banding. */
+        .memSize = GRAY_MJPEG_WIDTH * 8 * 2,
+        .frameSize = GRAY_MJPEG_WIDTH * GRAY_MJPEG_HEIGHT,   /* 1 byte/pixel (Y only) */
+    };
+
+    MJPEG_CFG_Type mjpegCfg =
+    {
+        .burst = MJPEG_BURST_INCR16,
+        .yuv = MJPEG_YUV400,                   /* grayscale, single Y component */
+        .frameCount = 0,
+        .waitCount = 0x100,
+        .bufferMjpeg = NULL,
+        .sizeMjpeg = mjpeg_buf_size,
+        .bufferCamYY = NULL,
+        .sizeCamYY = 2,
+        .bufferCamUV = 0,
+        .sizeCamUV = 0,
+        .resolutionX = GRAY_MJPEG_WIDTH,
+        .resolutionY = GRAY_MJPEG_HEIGHT,
+        .bitOrderEnable = ENABLE,
+        .evenOrderEnable = ENABLE,
+        .swapModeEnable = DISABLE,
+        .readStartEnable = ENABLE,
+        .reflectDmy = DISABLE,
+        .verticalDmy = DISABLE,
+        .horizationalDmy = DISABLE,
+    };
+
+    if (line_buf == NULL) {
+        line_buf = pvPortMalloc(GRAY_MJPEG_WIDTH * 8 * 2);
+        if (line_buf == NULL) {
+            ret = -1;
+            goto exit;
+        }
+    }
+
+    if (mjpeg_buf == NULL) {
+        mjpeg_buf = pvPortMalloc(mjpeg_buf_size);
+        if (mjpeg_buf == NULL) {
+            vPortFree(line_buf);
+            line_buf = NULL;
+            ret = -1;
+            goto exit;
+        }
+    }
+
+    DSP2_MISC_Scaler_Cfg_Type scaler_cfg =
+    {
+        .inputWidth = MIPI_WIDTH,
+        .inputHeight = MIPI_HEIGHT,
+        .outputWidth = GRAY_MJPEG_WIDTH,
+        .outputHeight = GRAY_MJPEG_HEIGHT,
+    };
+
+    cameraCfg.memStart = (uint32_t)(uintptr_t)line_buf;
+    mjpegCfg.bufferCamYY = (uint32_t)(uintptr_t)line_buf;
+    mjpegCfg.bufferMjpeg = (uint32_t)(uintptr_t)mjpeg_buf;
+
+    MJPEG_Set_YUYV_Order_Interleave(0,1,2,3);
+
+    MJPEG_Calculate_Quantize_Table(Q_Table_50_Y,tmpTableY,MJPEG_QUALITY);
+    MJPEG_Calculate_Quantize_Table(Q_Table_50_UV,tmpTableUV,MJPEG_QUALITY);
+    MJPEG_Set_Quantize_Table_Y(tmpTableY);
+    MJPEG_Set_Quantize_Table_UV(tmpTableUV);
+    MJPEG_Quantize_SRAM_Switch();
+
+    jpgHeadLength = JpegHeadCreate(YUV_MODE_400, MJPEG_QUALITY, GRAY_MJPEG_WIDTH, GRAY_MJPEG_HEIGHT, jpgHeadBuf);
+    memcpy((uint8_t *)JPEG_HEADER, jpgHeadBuf, jpgHeadLength); //cpy jpeg header to refernce sram 0x30021800
+    csi_dcache_clean_range((void *)JPEG_HEADER, jpgHeadLength);
+    MJPEG_Frame_Head_Set_Size(jpgHeadLength);
+    MJPEG_Frame_Tail_Auto_Fill(ENABLE);
+
+    DSP2_MISC_Scaler_Input_Select(DSP2_MISC_SCALER_2_ID, DSP2_MISC_SCALER_DSP2_INPUT);
+    DSP2_MISC_Scaler_Init(DSP2_MISC_SCALER_2_ID, &scaler_cfg);
+    DSP2_MISC_Scaler_Enable(DSP2_MISC_SCALER_2_ID);
+
+    DSP2_MISC_CAM_Input_Select(MJPEG_CAM_ID, DSP2_MISC_CAM_SCALER_2_OUTPUT);
+    CAM_Init(MJPEG_CAM_ID, &cameraCfg);
+    MJPEG_Init(&mjpegCfg);
+    MJPEG_Set_Planar_Y_UV_Input(4, 5);
+    MJPEG_Enable();
+
+    CAM_Enable(MJPEG_CAM_ID);
+exit:
+    return ret;
+}

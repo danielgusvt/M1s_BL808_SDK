@@ -48,4 +48,6 @@ void bl_cam_mipi_rgb565_deinit(void);
 int bl_cam_mipi_rgb565_frame_get(uint8_t **pic, uint32_t *len);
 void bl_cam_mipi_rgb565_frame_pop(void);
 int bl_cam_mipi_mjpeg_init(void);
+int bl_cam_mipi_mjpeg_gray_init(void);
+void bl_cam_mjpeg_flush(void);
 #endif
